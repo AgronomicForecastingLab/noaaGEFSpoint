@@ -25,10 +25,14 @@ download_downscale_site <- function(site_index,
                                     forecast_date = "all",
                                     downscale,
                                     overwrite,
+                                    noaa_var_names = NULL,
                                     model_name,
                                     model_name_ds,
-                                    output_directory){
-
+                                    output_directory, 
+                                    ensemble=10, 
+                                    tend=40 #10 days 4 sim per day
+                                    ) {
+  
   model_dir <- file.path(output_directory, model_name)
 
 
@@ -128,24 +132,12 @@ download_downscale_site <- function(site_index,
 
           model.run <- model.runs$model.run[which(model.runs$model.run == model_list[m])]
 
-          noaa_var_names <- c("tmp2m", "pressfc", "rh2m", "dlwrfsfc",
-                              "dswrfsfc", "apcpsfc",
-                              "ugrd10m", "vgrd10m", "tcdcclm")
-
-          #These are the cf standard names
-          cf_var_names <- c("air_temperature", "air_pressure", "relative_humidity", "surface_downwelling_longwave_flux_in_air",
-                            "surface_downwelling_shortwave_flux_in_air", "precipitation_flux", "eastward_wind", "northward_wind","cloud_area_fraction")
-
-          #Replace "eastward_wind" and "northward_wind" with "wind_speed"
-          cf_var_names1 <- c("air_temperature", "air_pressure", "relative_humidity", "surface_downwelling_longwave_flux_in_air",
-                             "surface_downwelling_shortwave_flux_in_air", "precipitation_flux","specific_humidity", "cloud_area_fraction","wind_speed")
-
           cf_var_units1 <- c("K", "Pa", "1", "Wm-2", "Wm-2", "kgm-2s-1", "1", "1", "ms-1")  #Negative numbers indicate negative exponents
 
           noaa_data <- list()
 
           download_issues <- FALSE
-
+  
           for(j in 1:length(noaa_var_names)){
 
             #For some reason rNOMADS::GetDODSDates doesn't return "gens" even
@@ -155,13 +147,14 @@ download_downscale_site <- function(site_index,
             lon <- which.min(abs(lon.dom - lon_east)) - 1 #NOMADS indexes start at 0
             lat <- which.min(abs(lat.dom - lat_list[site_index])) - 1 #NOMADS indexes start at 0
 
+ 
             noaa_data[[j]] <- tryCatch(rNOMADS::DODSGrab(model.url = curr_model.url,
                                                          model.run = model.run,
                                                          variables	= noaa_var_names[j],
-                                                         time = c(0, 64),
+                                                         time = c(0, tend),
                                                          lon = lon,
                                                          lat = lat,
-                                                         ensembles=c(0, 30)),
+                                                         ensembles=c(0, ensemble)),
                                        error = function(e){
                                          warning(paste(e$message, "skipping", curr_model.url, model.run, noaa_var_names[j]),
                                                  call. = FALSE)
@@ -187,82 +180,40 @@ download_downscale_site <- function(site_index,
             next
           }
 
-          names(noaa_data) <- cf_var_names
+          names(noaa_data) <- noaa_var_names
 
-          specific_humidity <- rh2qair(rh = noaa_data$relative_humidity$value / 100,
-                                       T = noaa_data$air_temperature$value,
-                                       press = noaa_data$air_pressure$value)
-
-          #Calculate wind speed from east and north components
-          wind_speed <- sqrt(noaa_data$eastward_wind$value^2 + noaa_data$northward_wind$value^2)
-
-          forecast_noaa <- tibble::tibble(time = noaa_data$air_temperature$forecast.date,
-                                          NOAA.member = noaa_data$air_temperature$ensembles,
-                                          air_temperature = noaa_data$air_temperature$value,
-                                          air_pressure= noaa_data$air_pressure$value,
-                                          relative_humidity = noaa_data$relative_humidity$value,
-                                          surface_downwelling_longwave_flux_in_air = noaa_data$surface_downwelling_longwave_flux_in_air$value,
-                                          surface_downwelling_shortwave_flux_in_air = noaa_data$surface_downwelling_shortwave_flux_in_air$value,
-                                          precipitation_flux = noaa_data$precipitation_flux$value,
-                                          specific_humidity = specific_humidity,
-                                          cloud_area_fraction = noaa_data$cloud_area_fraction$value,
-                                          wind_speed = wind_speed)
-
-          #9.999e+20 is the missing value so convert to NA
-          forecast_noaa$surface_downwelling_longwave_flux_in_air[forecast_noaa$surface_downwelling_longwave_flux_in_air == 9.999e+20] <- NA
-          forecast_noaa$surface_downwelling_shortwave_flux_in_air[forecast_noaa$surface_downwelling_shortwave_flux_in_air == 9.999e+20] <- NA
-          forecast_noaa$precipitation_flux[forecast_noaa$precipitation_flux == 9.999e+20] <- NA
-          forecast_noaa$cloud_area_fraction[forecast_noaa$cloud_area_fraction == 9.999e+20] <- NA
-
-          forecast_noaa$cloud_area_fraction <- forecast_noaa$cloud_area_fraction / 100 #Convert from % to proportion
-          forecast_noaa$relative_humidity <- forecast_noaa$relative_humidity / 100 #Convert from % to proportion
-
-          # Convert the 6 hr precip rate to per second.
-          forecast_noaa$precipitation_flux <- forecast_noaa$precipitation_flux / (60 * 60 * 6)
-
-
-          for (ens in 1:31) { # i is the ensemble number
-
-            #Turn the ensemble number into a string
-            if((ens-1)< 10){
-              ens_name <- paste0("0",ens-1)
-            }else{
-              ens_name <- ens-1
-            }
-
-            forecast_noaa_ens <- forecast_noaa %>%
-              dplyr::filter(NOAA.member == ens) %>%
-              dplyr::filter(!is.na(air_temperature))
-
-            end_date <- forecast_noaa_ens %>%
-              dplyr::summarise(max_time = max(time))
-
-            identifier <- paste(model_name, site_list[site_index], format(dplyr::first(forecast_noaa_ens$time), "%Y-%m-%dT%H"),
-                                format(end_date$max_time, "%Y-%m-%dT%H"), sep="_")
-
-            fname <- paste0(identifier,"_ens",ens_name,".nc")
-            output_file <- file.path(model_site_date_hour_dir,fname)
-
-            #Write netCDF
-            noaaGEFSpoint::write_noaa_gefs_netcdf(df = forecast_noaa_ens,ens, lat = lat_list[site_index], lon = lon_east, cf_units = cf_var_units1, output_file = output_file, overwrite = overwrite)
-
-            if(downscale){
-              #Downscale the forecast from 6hr to 1hr
-              modelds_site_date_hour_dir <- file.path(output_directory,model_name_ds,site_list[site_index],start_date,run_hour)
-
-              if(!dir.exists(modelds_site_date_hour_dir)){
-                dir.create(modelds_site_date_hour_dir, recursive=TRUE, showWarnings = FALSE)
-              }
-
-              identifier_ds <- paste(model_name_ds, site_list[site_index], format(dplyr::first(forecast_noaa_ens$time), "%Y-%m-%dT%H"),
-                                     format(end_date$max_time, "%Y-%m-%dT%H"), sep="_")
-
-              fname_ds <- file.path(modelds_site_date_hour_dir, paste0(identifier_ds,"_ens",ens_name,".nc"))
-
-              #Run downscaling
-              noaaGEFSpoint::temporal_downscale(input_file = output_file, output_file = fname_ds, overwrite = overwrite, hr = 1)
-            }
+          
+          noaa_df <- names(noaa_data) %>%
+            map_dfc(~ data.frame(noaa_data[[.x]]$value) %>%
+                      `colnames<-`(c(.x))
+            ) %>%
+            mutate(ensmbles=noaa_data[[1]]$ensembles,
+                   time=noaa_data[[1]]$forecast.date)
+          
+          if(all(c("ugrd10m","vgrd10m") %in% names(noaa_df))){
+            noaa_df <- noaa_df %>%
+              mutate(wind_speed = sqrt(noaa_df$ugrd10m^2 + noaa_df$vgrd10m^2)) %>%
+              dplyr::select(-ugrd10m, -vgrd10m)
           }
+          
+          if("dlwrfsfc" %in% names(noaa_df)){
+            noaa_df <- noaa_df %>%
+              mutate(dlwrfsfc = replace(dlwrfsfc, dlwrfsfc == 9.999e+20, NA))
+          }
+          
+          if("dswrfsfc" %in% names(noaa_df)){
+            noaa_df <- noaa_df %>%
+              mutate(dswrfsfc = replace(dswrfsfc, dswrfsfc == 9.999e+20, NA))
+          }
+          if("apcpsfc" %in% names(noaa_df)){
+            noaa_df <- noaa_df %>%
+              mutate(apcpsfc = replace(apcpsfc, apcpsfc == 9.999e+20, NA))
+          }
+          
+          
+
+
+      return(noaa_df)
         }
       }else{
         print(paste("Existing", site_list[site_index], start_time))
